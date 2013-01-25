@@ -1,0 +1,8 @@
+Expected time to run, <% $job->{time_expected} %>s, has been reached.
+\
+% return { subject => $job->{name}.' time exceeded' };
+\
+<%args>
+$instance
+$job
+</%args>

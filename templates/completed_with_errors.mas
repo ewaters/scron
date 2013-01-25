@@ -1,0 +1,11 @@
+Job completed with errors:
+% foreach my $error (@errors) {
+  <% $error %>
+% }
+\
+% return { subject => $job->config('hostname') . ' ' . $job->name . ' completed with errors' };
+<%args>
+$instance
+$job
+@errors
+</%args>

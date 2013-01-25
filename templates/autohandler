@@ -1,0 +1,21 @@
+% my $return_val = $m->call_next;
+
+-- Job Parameters -------------------------------------------------------------
+      Job: <% $job->{name} %>
+     Host: <% $job->config('hostname') %>
+  Command: <% $job->{command} %>
+  Started: <% $instance->{started_dt}->strftime('%F %T') %>
+% if ($instance->{finish_dt}) {
+Completed: <% $instance->{finish_dt}->strftime('%F %T') %>
+  Details:
+%	foreach my $key (sort keys %{ $instance->{time_output} }) {
+  - <% $key %> = <% $instance->{time_output}{$key} %>
+%	}
+% }
+\
+% return $return_val;
+\
+<%args>
+$job
+$instance
+</%args>

@@ -1,0 +1,882 @@
+#!/usr/bin/env perl
+
+=cut
+
+=head1 NAME
+
+scrond - Supervised Cron
+
+=head1 DESCRIPTION
+
+Cron is great for routine tasks on a single machine where one person is the sysadmin.  When you begin to have a multi-admin environment, with hundreds of machines, and you need to keep track of vital routine jobs, cron fails to live up to the task.
+
+scrond, a supervised cron daemon, calls cron-like commands, storing the output of the command and notifying admins about potential error conditions and states.  It expands the cron toolset by allowing one to specify how long a process is expected to take, what the error condition is expected to be, and other similar controls.  It allows one to keep closer track on cron jobs.
+
+=cut
+
+use strict;
+use warnings;
+use Log::Log4perl qw(get_logger :levels);
+use Log::Log4perl::Appender;
+use Log::Log4perl::Layout;
+use Log::Dispatch::Syslog;
+use POE;
+use Getopt::Long;
+use Params::Validate;
+use File::Copy; # for edit_config()
+use Proc::PID::File;
+use Proc::Daemon;
+
+our $VERSION = 0.3;
+
+## User parameters
+
+our %opts = (
+    daemon => 1,
+);
+GetOptions(
+    'help'     => \$opts{help},
+    'deploy'   => \$opts{deploy},
+    'check'    => \$opts{check},
+    'debug'    => \$opts{debug},
+    'config=s' => \$opts{config},
+    'edit'     => \$opts{edit},
+    'daemon!'  => \$opts{daemon},
+);
+
+$opts{config} ||= '/etc/scron/config.ini';
+
+if ($opts{help}) {
+    print <<EOF;
+$0 - Supervised Cron, version $VERSION
+
+    --config FILE   Override default config file
+    --check         Check the config for errors and exit
+ -e --edit          Edit the config in place with error checking
+    --debug         Turn on debug level logging
+    --deploy        Deploy the schema to the database
+ -h --help          This help screen
+    --no-daemon     Do not daemonize
+
+For more information, visit the man page
+EOF
+    exit;
+}
+
+# No daemon if --check or --deploy
+$opts{daemon} = 0 if $opts{check} || $opts{deploy} || $ENV{SCRON_TESTING};
+
+if ($opts{daemon}) {
+    Proc::Daemon::Init;
+}
+
+# Wait until after processing options (and help) to load heavier modules
+
+require Config::Simple;
+require DateTime;
+require POE::Component::Cron;
+
+require scron;
+require scron::Job;
+require scron::Plugin;
+
+=cut
+
+=head1 USAGE
+
+=head2 Command Line Arguments
+
+=head3 --config FILE_NAME
+
+=over 4
+
+Specify the config file to use.  Defaults to /etc/scron/config.ini
+
+=back
+
+=head3 --check
+
+=over 4
+
+Check the syntax of the configuration file and exit.
+
+=back
+
+=head3 --edit
+
+=over 4
+
+Similar to 'crontab -e', opens a temporary copy of the scron configuration file for editing, performing syntax checking before recording the changes.
+
+=back
+
+=head3 --debug
+
+=over 4
+
+Set's the logging level to DEBUG
+
+=back
+
+=head3 --deploy
+
+=over 4
+
+Deploy the backend database.  Will destroy existing data.
+
+=back
+
+=cut
+
+## Define globals
+
+our $local_tz = DateTime::TimeZone->new( name => 'local' );
+our ($schema, %config, $mason, $mason_output, $mailer, @plugins);
+
+## Define static locals 
+
+my $logger = Log::Log4perl->get_logger('scron');
+my $logger_layout = Log::Log4perl::Layout::PatternLayout->new("[\%d] \%p: \%m\%n");
+{
+    # Initialize the logger to at least the screen; wait for the config to do logfile
+
+    $logger->level($opts{debug} ? $DEBUG : $INFO);
+
+    # if not daemonizing...
+
+    my $stdout_appender = Log::Log4perl::Appender->new(
+        'Log::Log4perl::Appender::Screen',
+        name => 'screenlog',
+        stderr => 0,
+    );
+    $stdout_appender->layout($logger_layout);
+    $logger->add_appender($stdout_appender);
+}
+
+my %config_validate = (
+    main => {
+        template_cache_dir => { default => "/var/cache/scron" },
+        template_dir       => { default => "/etc/scron/templates" },
+
+        email_method       => {
+            default => 'sendmail',
+            regex => qr/^(sendmail|smtp)$/i,
+        },
+        email_smtp_server  => 0,
+
+        sqlite     => {
+            optional => 1,
+            #callbacks => { 'valid file' => sub { -f $_[0] }, },
+        },
+
+        mysql_user     => { default => 'root' },
+        mysql_pass     => { default => '' },
+        mysql_host     => { default => 'localhost' },
+        mysql_database => { default => 'scron' },
+
+        db_replay_log  => { default => '/var/spool/scron.replay' },
+
+        load_plugins   => { default => [] },
+
+        hostname => 1,
+        log_dir => { default => '/var/log' },
+        log_syslog => 0,
+        include_dir => {
+            optional => 1,
+            callbacks => { 'valid directory' => sub { return -d $_[0] } },
+        },
+
+        # Globally configurable Job settings
+        errors_to            => {
+            optional => 1,
+            callbacks => { 'valid email' => \&scron::_valid_email },
+        },
+        email_from           => {
+            optional => 1,
+            callbacks => { 'valid email' => \&scron::_valid_email },
+        },
+        email_subject_prefix => { default => '[SCRON] '},
+
+        no_email => { default => 0 },
+    },
+);
+
+my $check_db_delay = 30;
+
+=cut
+
+=head2 Config File
+
+=over 4
+
+The scrond config file is in INI format (think 'php.ini').  For example:
+
+  [main]
+  email_from = webmaster@xmission.com
+
+  [Update Passwords]
+  cron = 10 5 * * *
+  command = /usr/local/bin/update_passwords
+  errors_to = john@xmission.com
+
+Here, we've defined a cron job 'Update Passwords' that will run at 5:10 am every morning, sending errors to 'john@xmission.com'.
+
+=head3 [main]
+
+=over 4
+
+=item * template_dir (default: '/etc/scron/templates')
+
+=item * template_cache_dir (default: '/var/cache/scron')
+
+See L</"Templating"> below.
+
+=item * email_from (default: 'root')
+
+=item * email_method => sendmail || smtp (default: 'sendmail')
+
+=item * email_smtp_server
+
+=item * email_subject_prefix
+
+Defines different aspects of email generation.
+
+=item * errors_to
+
+Email address(s) to which scron errors will be sent by default.
+
+=item * sqlite
+
+Optional SQL db path to use for the database.
+
+=item * mysql_user
+
+=item * mysql_pass
+
+=item * mysql_host
+
+=item * mysql_database
+
+If not SQLite, you must provide MySQL details here.  See L</"Database"> for more information.
+
+=item * hostname
+
+Will be autodetermined using `hostname` if not provided.
+
+=item * log_dir (default: '/var/log')
+
+=item * include_dir
+
+Will search the directory specified for files named *.ini.  Each file found will be parsed similarly to the main configuration file, except that any directives outside a Job block will provide a default value for the following Job blocks.  For example, in the included file below:
+
+  cron = */15 * * * *
+
+  [Do Something]
+  command = /usr/bin/something
+
+  [Do Something Else]
+  command = /usr/bin/something_else
+
+Both jobs inherit the cron statement 'cron = */15 * * * *'.
+
+=item * load_plugins
+
+Provide a list of plugin names to load, or 'all' to load all that are found.  Each name is an available subclass of L<scron::Plugin>.
+
+=item * no_email
+
+If a plugin will be handling all notifications, you can disable HTML::Mason and other email-related modules in advance
+
+=back
+
+=head3 Job blocks
+
+=over 4
+
+=item * user
+
+=item * group
+
+Run the job as a user other than the scrond user/group.
+
+=item * cron (required)
+
+A string describing the frequency of running this job.  Similar to cron entries, see L<crontab(5)> and the extensions described in L<Set::Crontab>.
+
+=item * command (required)
+
+A bash-like string that will be executed in a forked process.  This will be prefixed with a wrapper program so you can't provide environment variables to it.
+
+B<NOTE:> If the command contains a literal quote ("), you must put the entire string in quotes (") and escape the internal quotes with a backslash (\").  This is a restriction of L<Config::Simple>.
+
+=item * time_expected
+
+Indicate how many seconds the job is expected to take.  If the job takes too much time, an error of 'time_exceeded' is generated, and the job will complete with errors.
+
+=item * exit_expected
+
+Indicate the status the process should exit with.  Completes with errors if exits with a different status.
+
+=item * concurrency (default: 1)
+
+Prevent the process from running any more than the indicated number of concurrent copies of itself.  This prevents the job from running too long and overlapping it's next scheduled execution, and also removes the need of the job from performing it's own locking controls (assuming it's only executed from scrond).
+
+=item * email_subject_prefix
+
+=item * email_from
+
+=item * errors_to
+
+Override the default values for these for this job.
+
+=item * template
+
+A catch-all template that will be used for formatting all error notifications.  See L</"Templating">.
+
+=item * splay
+
+In minutes.  If present, will modify the instance frequency by randomly adding or subtracting a duration of time up to the given splay value.  Each instance will occur on regular intervals, but the start time will be randomized.  This is useful if you have lots of machines running the same query against a server and need to avoid the server from being overloaded; each machine would make the query at a different time (randomly) but still maintain regularity.
+
+=back
+
+=cut
+
+## Edit config if needed
+
+if ($opts{edit}) {
+    edit_config();
+    exit;
+}
+
+## Create parent server
+
+POE::Session->create(
+    inline_states => {
+        _start => \&parent_start,
+        _stop  => \&parent_stop,
+        do_job => \&do_job,
+	sig_hup => \&reload,
+	reload  => \&reload,
+        sig_term => \&parent_stop,
+        check_db => \&check_db,
+
+        job_stdout => \&scron::Job::stdout,
+        job_stderr => \&scron::Job::stderr,
+        job_error  => \&scron::Job::error,
+        job_close  => \&scron::Job::closed,
+        job_check  => \&scron::Job::check,
+    },
+    heap => {
+    },
+);
+
+$poe_kernel->run();
+
+exit;
+
+### POE States ##
+
+sub parent_start {
+    my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
+
+    $kernel->alias_set('scrond');
+
+    $logger->debug("Reading config");
+    my $parsed = read_config();
+    if (! $parsed) {
+        $config{failed_check} = 1;
+        return;
+    }
+    %config = %$parsed;
+
+    # Connect to the model
+
+    $logger->debug("Connecting to schema");
+
+    # Disconnect previous connection (if 'reload' mainly)
+    eval {
+        $schema->dbh->disconnect if $schema;
+    };
+    warn $@ if $@;
+
+    my @dsn;
+
+    if ($config{main}{sqlite}) {
+        unlink $config{main}{sqlite} if $opts{deploy} && -f $config{main}{sqlite};
+        $opts{deploy} = 1 if ! -f $config{main}{sqlite};
+        @dsn = ('dbi:SQLite:'.$config{main}{sqlite});
+    }
+    elsif ($config{main}{mysql_user}) {
+        @dsn = (
+            'dbi:mysql:database='.$config{main}{mysql_database}.';host='.$config{main}{mysql_host},
+            $config{main}{mysql_user}, $config{main}{mysql_pass},
+        );
+    }
+
+    if ($opts{deploy}) {
+        require scron::Online;
+        $schema = scron::Online::Model->connect(@dsn);
+        $schema->storage->debugcb(sub {
+            $logger->debug(join ' ', $_[1]);
+        });
+        $schema->deploy($config{main}{sqlite} ? () : ({ add_drop_table => 1 }));
+        $logger->info("Deployed schema");
+        return;
+    }
+    else {
+        $schema = scron::Model->connect(@dsn);
+    }
+
+    # Create/find the Host object
+
+    my %Host = (
+        name => $config{main}{hostname},
+    );
+
+    $config{main}{_host_id} = scron::digest_id(%Host);
+
+    $schema->do_db('Host', 'create',
+        id => $config{main}{_host_id},
+        %Host,
+    );
+
+    # Create Job's for each block of the config (exluding 'main')
+
+    $heap->{jobs} = [];
+    foreach my $job_name (keys %config) {
+        next if $job_name eq 'main';
+        next if $config{$job_name}{disable};
+        my $job = scron::Job->new( name => $job_name, %{ $config{$job_name} } );
+        push @{ $heap->{jobs} }, $job;
+    }
+
+    if (! $config{main}{no_email}) {
+        require HTML::Mason;
+        require Email::Send;
+
+        # Create the global Mason object
+        $mason = HTML::Mason::Interp->new(
+            data_dir   => $config{main}{template_cache_dir},
+            comp_root  => $config{main}{template_dir},
+            out_method => \$mason_output,
+        );
+
+        # Create the global emailer
+        if ($config{main}{email_method} eq 'sendmail') {
+            $mailer = Email::Send->new({ mailer => 'Sendmail' });
+            {
+                no warnings 'once';
+                $Email::Send::Sendmail::SENDMAIL = '/usr/sbin/sendmail';
+            }
+        }
+        elsif ($config{main}{email_smtp_server}) {
+            $mailer = Email::Send->new({
+                mailer => 'SMTP',
+                mailer_args => [ Host => $config{main}{email_smtp_server} ],
+            });
+        }
+        else {
+            $logger->error("Must provide either 'email_method = sendmail' or a value for email_smtp_server");
+            return;
+        }
+    }
+
+    # Create a file logger
+    if (! $heap->{logger_open}) {
+        if ($config{main}{log_syslog}) {
+            my $syslog_appender = Log::Log4perl::Appender->new(
+                'Log::Dispatch::Syslog',
+                name => 'scron',
+                ident => 'scron',
+                logopt => 'pid',
+                min_level => $opts{debug} ? 'debug' : 'info',
+                facility => 'daemon',
+            );
+            $syslog_appender->layout( Log::Log4perl::Layout::PatternLayout->new("\%m\%n") );
+            $logger->add_appender($syslog_appender);
+        }
+        elsif ($config{main}{log_dir}) {
+            -d $config{main}{log_dir} || mkdir($config{main}{log_dir})
+                || die "Can't make log path '$config{main}{log_dir}': $!";
+            my $fn = $config{main}{log_dir}.'/scrond.log';
+            $logger->debug("Opening log file '$fn' for writing");
+
+            my $file_appender = Log::Log4perl::Appender->new(
+                'Log::Log4perl::Appender::File',
+                name => 'filelog',
+                filename => $fn,
+            );
+            $file_appender->layout( $logger_layout );
+
+            $logger->add_appender($file_appender);
+        }
+        $heap->{logger_open} = 1;
+    }
+
+    if ($opts{check}) {
+        $logger->info("Configuration checked - no problems");
+        # Without anything scheduled, POE will stop
+        return;
+    }
+
+    ## For each Job, create a scheduler
+
+    # Clear if they already exist (reloaded config)
+    if ($heap->{schedules}) {
+        foreach my $job_name (keys %{ $heap->{schedules} }) {
+            my $handle = delete $heap->{schedules}{$job_name};
+            $handle->delete();
+        }
+        delete $heap->{schedules};
+    }
+
+    my $now = DateTime->now( time_zone => $local_tz );
+    my $span = DateTime::Span->from_datetimes(
+        start => $now,
+        end   => DateTime::Infinite::Future->new(),
+    );
+
+    foreach my $job (@{ $heap->{jobs} }) {
+        my $iterator = $job->{cron_set}->iterator(span => $span);
+        if ($job->{splay}) {
+            my $splay_sec = (int(rand(2)) == 0 ? 1 : -1) * int(rand( ($job->{splay} * 60) + 1 ));
+            $iterator = DateTime::Set::Splay->from_set(
+                set => $iterator,
+                splay => DateTime::Duration->new( seconds => $splay_sec ),
+            );
+        }
+
+        $logger->debug("Adding job '$$job{name}' to scheduler, to be next called "
+            .$iterator->next($now));
+
+        # Run now and do nothing else if we're testing
+        if ($ENV{SCRON_TESTING}) {
+            $job->run();
+            next;
+        }
+
+        my $schedule = POE::Component::Cron->add(
+            $session, 'do_job', $iterator->clone, $job
+        );
+
+        $heap->{schedules}{ $job->{name} } = $schedule;
+    }
+
+    if ($opts{daemon} && ! $opts{check} && Proc::PID::File->running( verify => 1 )) {
+        $logger->info("Already running");
+        exit 1;
+    }
+
+    $logger->info("Started scron v$VERSION");
+
+    # Register the CHLD signal to clean up after dead children
+    $kernel->sig(CHLD => "sig_child");
+    $kernel->sig(HUP  => "sig_hup");
+    $kernel->sig(TERM => "sig_term");
+
+    # Setup interval of checking the db
+    $kernel->delay(check_db => $check_db_delay) unless $ENV{SCRON_TESTING};
+
+    # Let each plugin know we're starting
+    foreach my $plugin (@plugins) {
+        $plugin->start();
+    }
+}
+
+sub parent_stop {
+    if ($config{failed_check}) {
+        exit 1;
+    }
+    if (! $opts{deploy}  && ! $opts{check}) {
+        $logger->info("Stopped scron v$VERSION");
+    }
+}
+
+sub do_job {
+    my ($kernel, $heap, $job) = @_[KERNEL, HEAP, ARG0];
+
+    $logger->debug("Job '$$job{name}' called");
+
+    $job->run();
+}
+
+sub reload {
+    my ($kernel, $heap) = @_[KERNEL, HEAP];
+    $kernel->sig_handled();
+
+    $logger->info("Reloading config");
+    $kernel->yield('_start');
+}
+
+sub check_db {
+    my ($kernel, $heap) = @_[KERNEL, HEAP];
+
+    $kernel->delay(check_db => $check_db_delay);
+
+    $schema->reconnect if $schema->offline;
+
+    $schema->replay if ! $schema->offline && $schema->need_replay;
+}
+
+### Utility Methods ##
+
+## read_config ([ $config_file ])
+#
+#  Parse the config file, performing validation on all values.
+#  Returns a hashref of the config.
+
+sub read_config {
+    my ($config_file) = @_;
+    $config_file ||= $opts{config};
+
+    my %parsed = parse_config_file($config_file);
+    if (! %parsed) {
+        return 0;
+    }
+
+    # Set config defaults
+
+    my $hostname = `hostname`;
+    chomp $hostname;
+    $parsed{main}{hostname} ||= $hostname;
+
+    if ($parsed{main}{include_dir} && -d $parsed{main}{include_dir}) {
+        foreach my $file (glob $parsed{main}{include_dir} . '/*.ini') {
+            my ($base_name) = $file =~ m{/([^/]+)\.ini$};
+            my %include = parse_config_file($file);
+            if (! %include) {
+                next;
+            }
+            # Merge into the main %parsed hash, using default values if present to provide default job-specific values
+            my $default = delete $include{default};
+            foreach my $key (keys %include) {
+                $parsed{$base_name . '/' . $key} = $default ? { %$default, %{ $include{$key} } } : $include{$key};
+            }
+        }
+    }
+
+    # (re)Load plugins if needed
+    
+    foreach my $plugin (@plugins) {
+        $plugin->stop;
+    }
+    @plugins = ();
+
+    my @load_plugins;
+    if (my $load_plugins = $parsed{main}{load_plugins}) {
+        @load_plugins = ref $load_plugins ? @$load_plugins : ($load_plugins);
+    }
+    foreach my $class (scron::Plugin->classes) {
+        my ($subclass) = $class =~ m{^scron::Plugin::(.+)};
+        next unless grep { $_ =~ m{^($subclass|all|\*)$}i } @load_plugins;
+        my $plugin = $class->new();
+        push @plugins, $plugin;
+    }
+
+    # ... and validate
+
+    my $is_valid = validate_config(\%parsed);
+    return 0 unless $is_valid;
+
+    foreach my $plugin (@plugins) {
+        $plugin->modify_config(\%parsed);
+    }
+
+    my @blocks = keys %parsed;
+    if (int @blocks == 1 && $parsed{main}) {
+        $logger->error("No jobs specified");
+        return 0;
+    }
+
+    return \%parsed;
+}
+
+## validate_config ($config)
+#
+#  Returns 0 if invalid, 1 if okay
+
+sub validate_config {
+    my ($parsed) = @_;
+
+    foreach my $block (keys %$parsed) {
+        my $spec = $config_validate{$block} || scron::Job->validation_spec;
+        foreach my $plugin (@plugins) {
+            $plugin->update_validate_spec($block, $spec);
+        }
+        eval {
+            my %validated_config = Params::Validate::validate_with(
+                params => $parsed->{$block},
+                spec => $spec,
+                on_fail => sub {
+                    my $err = shift;
+                    if ($err =~ /but was not listed in the validation options: (.+)/) {
+                        $err = "unknown option '$1'";
+                    }
+                    elsif ($err =~ /Mandatory parameter '(.+?)' missing/) {
+                        $err = "missing option '$1'";
+                    }
+                    die $err . "\n";
+                },
+            );
+            $parsed->{$block} = \%validated_config;
+        };
+        if (my $err = $@) {
+            chomp $err;
+            $logger->error("Failed to validate block [$block]: $err");
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+## parse_config_file ($config_file)
+#
+#  Reads a single configuration file
+
+sub parse_config_file {
+    my $config_file = shift;
+
+    # Get subhash for each block of config
+    my $cfg = Config::Simple->new($config_file);
+    if (! $cfg) {
+        $logger->error("Couldn't parse '$config_file'");
+        return;
+    }
+
+    my %parsed;
+    my $hash = $cfg->vars();
+    while (my ($key, $value) = each %$hash) {
+        my ($block, $param) = $key =~ /^(.+)\.([^.]+)$/;
+        if (! $param) {
+            $logger->error("Couldn't parse configuration key '$key'");
+            next;
+        }
+        $parsed{$block}{$param} = $value;
+    }
+
+    return %parsed;
+}
+
+## edit_config ()
+#
+#  Edit a config file in a temporary location using the system editor, only
+#  copying it into place if the edited file has valid syntax.
+
+sub edit_config {
+    require Term::ReadLine;
+    my $term = Term::ReadLine->new('default');
+
+    my $fn = $opts{config};
+
+    # Copy to a temporary location
+    my $tmp_fn = "/tmp/scron-".int(rand(1000)).'-'.$$.'.tmp.ini';
+    copy($fn, $tmp_fn) or die "Couldn't copy $fn -> $tmp_fn: $!";
+
+    my $is_valid;
+    while (1) {
+        # Edit it in temp location
+        system('editor', $tmp_fn);
+
+        # Check for validity
+        $is_valid = read_config($tmp_fn);
+        last if $is_valid;
+
+        my $response = ask_question($term, "Edited file was invalid.  Fix errors?", qw(Yes no));
+        if ($response eq 'no') {
+            print "Giving up on edit\n";
+            last;
+        }
+    }
+
+    if ($is_valid) {
+        copy($tmp_fn, $fn) or die "Couldn't copy $tmp_fn -> $fn: $!";
+        print "Configuration edited.  Reload scrond to take effect.\n";
+        return 1;
+    }
+
+    return;
+}
+
+## ask_question ($Term_ReadLine, $question, @responses)
+#
+#  Given a term and a question to ask, return an acceptable response.
+#  In the list of responses ('Yes', 'no', 'later'), the question will be
+#  appended with the usage statement ' [Y/n/l]', will default to 'Yes',
+#  and will accept any close approximation of the response words for an
+#  answer ('la' => 'later').  Uppercased first letter in the response
+#  words make it a default response if none is received.
+#
+#  Returns the lowercased response selected.
+
+sub ask_question {
+    my ($term, $question, @responses) = @_;
+
+    @responses = ('Yes') if ! @responses;
+
+    my (@chars, %chars, $default);
+    foreach my $response (@responses) {
+        my $char = substr $response, 0, 1;
+        if ($chars{lc $char}) {
+            die "More than one response with the same first initial";
+        }
+        $chars{lc $char} = lc $response;
+        push @chars, $char;
+        $default = lc $response if $char =~ /[A-Z]/;
+    }
+
+    my ($response);
+    while (1) {
+        my $action = $term->readline("$question [".join('/', @chars)."] ");
+        if (! defined $action || length $action == 0) {
+            $response = $default;
+            last;
+        }
+        
+        ($response) = grep { $_ =~ /^$action/i } @responses;
+        if (! $response) {
+            print "Response should be in: ".join(', ', @responses)." (you said '$action')\n";
+            next;
+        }
+        last;
+    }
+
+    return lc $response;
+}
+
+=head1 Jobs
+
+B<scrond> is designed to execute jobs that are able to report problems via STDERR.  All output from a program over STDERR are considered errors and treated as such.  All STDOUT output is recorded for later inspection but doesn't indicate an error condition.
+
+Each defined job will be scheduled and executed at the time indicated.  The job is given as much time as needed and is expected to close at some point.  Aside from the 'time_expected' flag, a job won't be evaluated for errors until after it closes.  The exit status, time expected, or presence of STDERR output indicates that the job completed with errors, triggering notification.
+
+Error notification is done using email and the email settings provided.  Using a template, the job constructs an email and sends to the interested parties.  Every step of this is logged and recorded to the database for later inspection / 10,000 Foot View.
+
+=head1 Database
+
+B<scrond> attempts to relieve the administrative needs of a group of machines.  It records job status, STDERR and STDOUT, to a central database to provide administrators with the means to see all "broken windows" at once.  To set this up the first time, run scrond with the arg '--deploy' after configuring the db parameters.
+
+A future interface will be developed to access this shared database and view failing jobs easily.  It will use the C<scron.pm> module which is the base module that scrond uses to access the db.
+
+=head1 Templating
+
+With the idea that a single email format won't work for all jobs and servers, the formatting of the error emails is done using L<HTML::Mason>.  There are currently two templates used, 'completed_with_errors' and 'time_exceeded', but more may follow.
+
+These can be customized (they're found in config:template_dir), or a job can provide it's own template name (also needs to be found in config:template_dir, ending in '.mas') that will be evaluated with the args ($instance, $job, @errors, $type) where $type will be 'completed_with_errors' or 'time_exceeded'.  If the template needs to override the subject, it can do so by returning a hashref with the key 'subject'.  See the existing templates for more information on how this works.
+
+=head1 SEE ALSO
+
+L<DateTime::Event::Cron>, L<HTML::Mason>, L<POE::Component::Cron>, L<Config::Simple>
+
+=head1 AUTHOR
+
+Eric Waters <ewaters@gmail.com>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2013 Eric Waters and XMission LLC (http://www.xmission.com/). All rights reserved. This program is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
+
+The full text of the license can be found in the LICENSE file included with this module.
+
+=cut
+

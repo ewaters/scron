@@ -1,0 +1,18 @@
+Source: scron
+Section: perl
+Priority: optional
+Build-Depends: debhelper (>= 4.0.2), libmodule-build-perl
+Build-Depends-Indep: perl (>= 5.8.0-7)
+Maintainer: Eric Waters <ewaters@mammon.xmission.com>
+Standards-Version: 3.6.1
+
+Package: scron
+Architecture: all
+Depends: ${perl:Depends}, ${misc:Depends}, libconfig-simple-perl, libdatetime-perl, liblog-log4perl-perl, liblog-dispatch-perl, libpoe-perl, libparams-validate-perl, libclass-accessor-perl, libpoe-component-cron-perl, libdbd-mysql-perl, time, libyaml-perl, libsql-abstract-perl, libmodule-pluggable-perl, libwww-perl, xm-notify, gnupg, libproc-pid-file-perl, libproc-daemon-perl
+Suggests: libdbix-class-perl (>= 0.05), libhtml-mason-perl, libemail-send-perl, libemail-mime-creator-perl, libemail-address-perl
+Description:  Supervised Cron
+ Cron is great for routine tasks on a single machine where one person is the sysadmin.  When you begin to have a multi-admin environment, with hundreds of machines, and you need to keep track of vital routine jobs, cron fails to live up to the task.
+ .
+ scrond, a supervised cron daemon, calls cron-like commands, storing the output of the command and notifying admins about potential error conditions and states.  It expands the cron toolset by allowing one to specify how long a process is expected to take, what the error condition is expected to be, and other similar controls.  It allows one to keep closer track on cron jobs.
+ .
+ This description was automagically extracted from the module by dh-make-perl.

@@ -1,0 +1,4 @@
+/etc/scron/config.ini
+/etc/scron/templates/autohandler
+/etc/scron/templates/completed_with_errors.mas
+/etc/scron/templates/time_exceeded.mas
