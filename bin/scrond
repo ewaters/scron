@@ -131,9 +131,9 @@ Deploy the backend database.  Will destroy existing data.
 ## Define globals
 
 our $local_tz = DateTime::TimeZone->new( name => 'local' );
-our ($schema, %config, $mason, $mason_output, $mailer, @plugins);
+our ($schema, %config, $mason, $mason_output, $mail_transport, @plugins);
 
-## Define static locals 
+## Define static locals
 
 my $logger = Log::Log4perl->get_logger('scron');
 my $logger_layout = Log::Log4perl::Layout::PatternLayout->new("[\%d] \%p: \%m\%n");
@@ -159,7 +159,7 @@ my %config_validate = (
         template_dir       => { default => "/etc/scron/templates" },
 
         email_method       => {
-            default => 'sendmail',
+            optional => 1,
             regex => qr/^(sendmail|smtp)$/i,
         },
         email_smtp_server  => 0,
@@ -197,7 +197,6 @@ my %config_validate = (
         },
         email_subject_prefix => { default => '[SCRON] '},
 
-        no_email => { default => 0 },
     },
 );
 
@@ -233,7 +232,7 @@ See L</"Templating"> below.
 
 =item * email_from (default: 'root')
 
-=item * email_method => sendmail || smtp (default: 'sendmail')
+=item * email_method => sendmail || smtp
 
 =item * email_smtp_server
 
@@ -282,10 +281,6 @@ Both jobs inherit the cron statement 'cron = */15 * * * *'.
 =item * load_plugins
 
 Provide a list of plugin names to load, or 'all' to load all that are found.  Each name is an available subclass of L<scron::Plugin>.
-
-=item * no_email
-
-If a plugin will be handling all notifications, you can disable HTML::Mason and other email-related modules in advance
 
 =back
 
@@ -450,29 +445,25 @@ sub parent_start {
         push @{ $heap->{jobs} }, $job;
     }
 
-    if (! $config{main}{no_email}) {
-        require HTML::Mason;
-        require Email::Send;
+    require HTML::Mason;
+    # Create the global Mason object
+    $mason = HTML::Mason::Interp->new(
+        data_dir   => $config{main}{template_cache_dir},
+        comp_root  => $config{main}{template_dir},
+        out_method => \$mason_output,
+    );
 
-        # Create the global Mason object
-        $mason = HTML::Mason::Interp->new(
-            data_dir   => $config{main}{template_cache_dir},
-            comp_root  => $config{main}{template_dir},
-            out_method => \$mason_output,
-        );
+    if (defined $config{main}{email_method}) {
 
         # Create the global emailer
         if ($config{main}{email_method} eq 'sendmail') {
-            $mailer = Email::Send->new({ mailer => 'Sendmail' });
-            {
-                no warnings 'once';
-                $Email::Send::Sendmail::SENDMAIL = '/usr/sbin/sendmail';
-            }
+            require Email::Sender::Transport::Sendmail;
+            $mail_transport = Email::Sender::Transport::Sendmail->new();
         }
         elsif ($config{main}{email_smtp_server}) {
-            $mailer = Email::Send->new({
-                mailer => 'SMTP',
-                mailer_args => [ Host => $config{main}{email_smtp_server} ],
+            require Email::Sender::Transport::SMTP;
+            $mail_transport = Email::Sender::Transport::SMTP->new({
+                host => $config{main}{email_smtp_server},
             });
         }
         else {

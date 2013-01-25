@@ -74,7 +74,7 @@ test_job('File Listing', 2);
 
 $schema->storage->disconnect;
 
-#system "rm -rf $tmp_dir";
+system "rm -rf $tmp_dir";
 
 sub test_job {
     my ($job_name, $expected_count) = @_;

@@ -117,7 +117,7 @@ ok(-f $email_output_dir . '/Long Running Process.0', 'Job created email output')
 
 $schema->storage->disconnect;
 
-#system "rm -rf $tmp_dir";
+system "rm -rf $tmp_dir";
 
 sub test_job {
     my ($job_name, $status_expected, $output_expected) = @_;

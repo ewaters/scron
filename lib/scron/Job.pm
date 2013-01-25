@@ -2,7 +2,7 @@ package scron::Job;
 
 ## Not relevant and probably won't work if not used by scrond
 #
-#  Uses main:: globals qw($schema $local_tz $config $mason_output $mason $mailer)
+#  Uses main:: globals qw($schema $local_tz $config $mason_output $mason $mail_transport)
 
 use strict;
 use warnings;
@@ -13,6 +13,7 @@ use Log::Log4perl qw(get_logger :levels);
 use List::Util qw(first);
 use Time::HiRes qw(tv_interval gettimeofday);
 use Digest::MD5 qw(md5_base64);
+use Email::Sender::Simple qw(sendmail);
 
 use base qw(Class::Accessor);
 scron::Job->mk_accessors(qw(logger name command));
@@ -494,7 +495,7 @@ sub notify {
         $self->logger->info("Would send email:\n" . ( '=' x 80 ) . "\n" . $email->as_string . ( '=' x 80 ));
     }
     else {
-        $main::mailer->send($email->as_string);
+        sendmail($email->as_string, { transport => $main::mail_transport });
     }
 }
 
