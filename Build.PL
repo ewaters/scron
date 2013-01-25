@@ -30,7 +30,7 @@ my $build = Module::Build->new(
     },
     #sign => 1,
     create_makefile_pl => 'passthrough',
-    create_readme => 1,
+    #create_readme => 1,
     install_path => {
         conf   => '/etc/scron',
         script => '/usr/sbin',

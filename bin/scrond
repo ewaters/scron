@@ -1,7 +1,5 @@
 #!/usr/bin/env perl
 
-=cut
-
 =head1 NAME
 
 scrond - Supervised Cron
@@ -79,8 +77,6 @@ require POE::Component::Cron;
 require scron;
 require scron::Job;
 require scron::Plugin;
-
-=cut
 
 =head1 USAGE
 
@@ -202,8 +198,6 @@ my %config_validate = (
 
 my $check_db_delay = 30;
 
-=cut
-
 =head2 Config File
 
 =over 4
@@ -219,6 +213,8 @@ The scrond config file is in INI format (think 'php.ini').  For example:
   errors_to = john@xmission.com
 
 Here, we've defined a cron job 'Update Passwords' that will run at 5:10 am every morning, sending errors to 'john@xmission.com'.
+
+=back
 
 =head3 [main]
 

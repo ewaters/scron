@@ -1,0 +1,220 @@
+=head1 NAME
+
+scrond - Supervised Cron
+
+=head1 DESCRIPTION
+
+Cron is great for routine tasks on a single machine where one person is the sysadmin.  When you begin to have a multi-admin environment, with hundreds of machines, and you need to keep track of vital routine jobs, cron fails to live up to the task.
+
+scrond, a supervised cron daemon, calls cron-like commands, storing the output of the command and notifying admins about potential error conditions and states.  It expands the cron toolset by allowing one to specify how long a process is expected to take, what the error condition is expected to be, and other similar controls.  It allows one to keep closer track on cron jobs.
+
+=head1 USAGE
+
+=head2 Command Line Arguments
+
+=head3 --config FILE_NAME
+
+=over 4
+
+Specify the config file to use.  Defaults to /etc/scron/config.ini
+
+=back
+
+=head3 --check
+
+=over 4
+
+Check the syntax of the configuration file and exit.
+
+=back
+
+=head3 --edit
+
+=over 4
+
+Similar to 'crontab -e', opens a temporary copy of the scron configuration file for editing, performing syntax checking before recording the changes.
+
+=back
+
+=head3 --debug
+
+=over 4
+
+Set's the logging level to DEBUG
+
+=back
+
+=head3 --deploy
+
+=over 4
+
+Deploy the backend database.  Will destroy existing data.
+
+=back
+
+=head2 Config File
+
+=over 4
+
+The scrond config file is in INI format (think 'php.ini').  For example:
+
+  [main]
+  email_from = webmaster@xmission.com
+
+  [Update Passwords]
+  cron = 10 5 * * *
+  command = /usr/local/bin/update_passwords
+  errors_to = john@xmission.com
+
+Here, we've defined a cron job 'Update Passwords' that will run at 5:10 am every morning, sending errors to 'john@xmission.com'.
+
+=back
+
+=head3 [main]
+
+=over 4
+
+=item * template_dir (default: '/etc/scron/templates')
+
+=item * template_cache_dir (default: '/var/cache/scron')
+
+See L</"Templating"> below.
+
+=item * email_from (default: 'root')
+
+=item * email_method => sendmail || smtp
+
+=item * email_smtp_server
+
+=item * email_subject_prefix
+
+Defines different aspects of email generation.
+
+=item * errors_to
+
+Email address(s) to which scron errors will be sent by default.
+
+=item * sqlite
+
+Optional SQL db path to use for the database.
+
+=item * mysql_user
+
+=item * mysql_pass
+
+=item * mysql_host
+
+=item * mysql_database
+
+If not SQLite, you must provide MySQL details here.  See L</"Database"> for more information.
+
+=item * hostname
+
+Will be autodetermined using `hostname` if not provided.
+
+=item * log_dir (default: '/var/log')
+
+=item * include_dir
+
+Will search the directory specified for files named *.ini.  Each file found will be parsed similarly to the main configuration file, except that any directives outside a Job block will provide a default value for the following Job blocks.  For example, in the included file below:
+
+  cron = */15 * * * *
+
+  [Do Something]
+  command = /usr/bin/something
+
+  [Do Something Else]
+  command = /usr/bin/something_else
+
+Both jobs inherit the cron statement 'cron = */15 * * * *'.
+
+=item * load_plugins
+
+Provide a list of plugin names to load, or 'all' to load all that are found.  Each name is an available subclass of L<scron::Plugin>.
+
+=back
+
+=head3 Job blocks
+
+=over 4
+
+=item * user
+
+=item * group
+
+Run the job as a user other than the scrond user/group.
+
+=item * cron (required)
+
+A string describing the frequency of running this job.  Similar to cron entries, see L<crontab(5)> and the extensions described in L<Set::Crontab>.
+
+=item * command (required)
+
+A bash-like string that will be executed in a forked process.  This will be prefixed with a wrapper program so you can't provide environment variables to it.
+
+B<NOTE:> If the command contains a literal quote ("), you must put the entire string in quotes (") and escape the internal quotes with a backslash (\").  This is a restriction of L<Config::Simple>.
+
+=item * time_expected
+
+Indicate how many seconds the job is expected to take.  If the job takes too much time, an error of 'time_exceeded' is generated, and the job will complete with errors.
+
+=item * exit_expected
+
+Indicate the status the process should exit with.  Completes with errors if exits with a different status.
+
+=item * concurrency (default: 1)
+
+Prevent the process from running any more than the indicated number of concurrent copies of itself.  This prevents the job from running too long and overlapping it's next scheduled execution, and also removes the need of the job from performing it's own locking controls (assuming it's only executed from scrond).
+
+=item * email_subject_prefix
+
+=item * email_from
+
+=item * errors_to
+
+Override the default values for these for this job.
+
+=item * template
+
+A catch-all template that will be used for formatting all error notifications.  See L</"Templating">.
+
+=item * splay
+
+In minutes.  If present, will modify the instance frequency by randomly adding or subtracting a duration of time up to the given splay value.  Each instance will occur on regular intervals, but the start time will be randomized.  This is useful if you have lots of machines running the same query against a server and need to avoid the server from being overloaded; each machine would make the query at a different time (randomly) but still maintain regularity.
+
+=back
+
+=head1 Jobs
+
+B<scrond> is designed to execute jobs that are able to report problems via STDERR.  All output from a program over STDERR are considered errors and treated as such.  All STDOUT output is recorded for later inspection but doesn't indicate an error condition.
+
+Each defined job will be scheduled and executed at the time indicated.  The job is given as much time as needed and is expected to close at some point.  Aside from the 'time_expected' flag, a job won't be evaluated for errors until after it closes.  The exit status, time expected, or presence of STDERR output indicates that the job completed with errors, triggering notification.
+
+Error notification is done using email and the email settings provided.  Using a template, the job constructs an email and sends to the interested parties.  Every step of this is logged and recorded to the database for later inspection / 10,000 Foot View.
+
+=head1 Database
+
+B<scrond> attempts to relieve the administrative needs of a group of machines.  It records job status, STDERR and STDOUT, to a central database to provide administrators with the means to see all "broken windows" at once.  To set this up the first time, run scrond with the arg '--deploy' after configuring the db parameters.
+
+A future interface will be developed to access this shared database and view failing jobs easily.  It will use the C<scron.pm> module which is the base module that scrond uses to access the db.
+
+=head1 Templating
+
+With the idea that a single email format won't work for all jobs and servers, the formatting of the error emails is done using L<HTML::Mason>.  There are currently two templates used, 'completed_with_errors' and 'time_exceeded', but more may follow.
+
+These can be customized (they're found in config:template_dir), or a job can provide it's own template name (also needs to be found in config:template_dir, ending in '.mas') that will be evaluated with the args ($instance, $job, @errors, $type) where $type will be 'completed_with_errors' or 'time_exceeded'.  If the template needs to override the subject, it can do so by returning a hashref with the key 'subject'.  See the existing templates for more information on how this works.
+
+=head1 SEE ALSO
+
+L<DateTime::Event::Cron>, L<HTML::Mason>, L<POE::Component::Cron>, L<Config::Simple>
+
+=head1 AUTHOR
+
+Eric Waters <ewaters@gmail.com>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2013 Eric Waters and XMission LLC (http://www.xmission.com/). All rights reserved. This program is free software; you can redistribute it and/or modify it under the same terms as Perl itself.
+
+The full text of the license can be found in the LICENSE file included with this module.
+
